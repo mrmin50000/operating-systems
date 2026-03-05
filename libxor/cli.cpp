@@ -30,7 +30,7 @@ int main(int argc, char *argv[]) {
 
     unsigned char *lib_key = reinterpret_cast<unsigned char*>(dlsym(handle, "key"));
     if (!lib_key) {
-        std::cerr << "Error: Not found 'key' int lib: " << dlerror() << "\n";
+        std::cerr << "Error: Not found 'key' in lib: " << dlerror() << "\n";
         dlclose(handle);
         return 1;
     }
