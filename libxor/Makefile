@@ -5,18 +5,17 @@ LDFLAGS = -shared
 TARGET = libxor.so
 SRC = xor.cpp
 
-CLI_TARGET = cli
-CLI_SRC = cli.cpp 
+SECURE_COPY_TARGET = secure_copy
+SECURE_COPY_SRC = secure_copy.cpp 
 
-all: $(TARGET) $(CLI_TARGET)
+all: $(TARGET) $(SECURE_COPY_TARGET)
 
 $(TARGET): $(SRC) xor.h
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRC)
 
-$(CLI_TARGET): $(CLI_SRC)
-	$(CXX) -o $@ $(CLI_SRC) -ldl
-
+$(SECURE_COPY_TARGET): $(SECURE_COPY_SRC)
+	$(CXX) -o $@ $(SECURE_COPY_SRC) -pthread -ldl
 clean:
-	rm -f $(TARGET) $(CLI_TARGET)
+	rm -f $(TARGET) $(SECURE_COPY_TARGET)
 
 .PHONY: all clean

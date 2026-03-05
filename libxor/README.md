@@ -1,3 +1,3 @@
 Make: ```make``` <br>
-Cli for encrypting: ```./cli ./libxor.so 42 input.txt encrypted.bin``` <br>
-Cli for decrypting: ```./cli ./libxor.so 42 encrypted.bin decrypted.txt```
+Cli for encrypting: ```./secure_copy input.txt encrypted.bin 42``` <br>
+Cli for decrypting: ```./secure_copy encrypted.bin decrypted.txt 42```
