@@ -13,69 +13,59 @@
 #include <ctime>
 #include <errno.h>
 #include <iomanip>
+#include <sstream>
+
+#ifndef WORKERS_COUNT
+#define WORKERS_COUNT 4
+#endif
 
 const size_t BUFFER_SIZE = 4096;
 const char* LIB_PATH = "./libxor.so";
-const int MUTEX_TIMEOUT_SEC = 5;
-const int NUM_WORKER_THREADS = 3;
+
+enum ProcessMode {
+    MODE_SEQUENTIAL,
+    MODE_PARALLEL,
+    MODE_AUTO
+};
+
+struct Stats {
+    double total_time;
+    double avg_time_per_file;
+    int processed_count;
+    std::vector<double> file_times;
+};
 
 struct SharedData {
-    pthread_mutex_t global_mutex;
+    pthread_mutex_t queue_mutex;
+    pthread_cond_t queue_cond;
     std::vector<std::string> files;
-    size_t next_file_index;
+    size_t head_index;
+    size_t tail_index;
+    bool stop;
     int copied_count;
     std::string output_dir;
     int encryption_key;
-    
     void* lib_handle;
     unsigned char* lib_key;
     typedef void (*cipher_func_t)(void*, void*, int);
     cipher_func_t cipher;
+    Stats stats;
 };
 
-SharedData g_data;
-
-int safe_lock_mutex(pthread_mutex_t* mutex) {
+int safe_lock_mutex(pthread_mutex_t* mutex, int timeout_sec) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += MUTEX_TIMEOUT_SEC;
-
+    ts.tv_sec += timeout_sec;
     int ret = pthread_mutex_timedlock(mutex, &ts);
     if (ret == ETIMEDOUT) {
         std::cerr << "\n[WARNING] Possible deadlock: thread waits for mutex more than " 
-                  << MUTEX_TIMEOUT_SEC << " seconds!\n";
+                  << timeout_sec << " seconds!\n";
         return -1;
     } else if (ret != 0) {
         std::cerr << "\n[ERROR] Mutex lock error: " << strerror(ret) << "\n";
         return -1;
     }
     return 0;
-}
-
-void log_operation_locked(const std::string& filename, bool success, double exec_time) {
-    std::ofstream log_file("log.txt", std::ios::app);
-    if (!log_file.is_open()) {
-        std::cerr << "Error: Cannot open log.txt\n";
-        return;
-    }
-
-    time_t now = time(0);
-    struct tm* ltm = localtime(&now);
-    char time_buf[64];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", ltm);
-
-    unsigned long tid = (unsigned long)pthread_self();
-
-    std::string result = success ? "SUCCESS" : "ERROR";
-
-    log_file << "[" << time_buf << "] "
-             << "Thread-" << tid << " | "
-             << "File: " << filename << " | "
-             << "Result: " << result << " | "
-             << "Time: " << std::fixed << std::setprecision(3) << exec_time << "s"
-             << std::endl;
-    
-    log_file.close();
 }
 
 bool process_file(const std::string& input_path, const std::string& output_dir, 
@@ -112,46 +102,49 @@ bool process_file(const std::string& input_path, const std::string& output_dir,
     return true;
 }
 
+double get_time_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
 void* worker_thread(void* arg) {
     SharedData* data = (SharedData*)arg;
     
     while (true) {
         std::string current_file;
-        size_t file_index = 0;
-
-        if (safe_lock_mutex(&data->global_mutex) != 0) {
-            return nullptr; // Timeout or error
-        }
-
-        if (data->next_file_index < data->files.size()) {
-            file_index = data->next_file_index;
-            current_file = data->files[data->next_file_index];
-            data->next_file_index++;
+        
+        pthread_mutex_lock(&data->queue_mutex);
+        
+        while (data->head_index >= data->files.size() && !data->stop) {
+            pthread_cond_wait(&data->queue_cond, &data->queue_mutex);
         }
         
-        pthread_mutex_unlock(&data->global_mutex);
-
-        if (current_file.empty()) {
+        if (data->head_index >= data->files.size() && data->stop) {
+            pthread_mutex_unlock(&data->queue_mutex);
             break;
         }
-
-        clock_t start_time = clock();
+        
+        current_file = data->files[data->head_index];
+        data->head_index++;
+        
+        pthread_mutex_unlock(&data->queue_mutex);
+        
+        double start_time = get_time_ms();
         bool success = process_file(current_file, data->output_dir, data);
-        clock_t end_time = clock();
-        double exec_time = static_cast<double>(end_time - start_time) / CLOCKS_PER_SEC;
-
-        if (safe_lock_mutex(&data->global_mutex) != 0) {
-            return nullptr;
-        }
-
+        double end_time = get_time_ms();
+        double file_time = end_time - start_time;
+        
+        pthread_mutex_lock(&data->queue_mutex);
+        
         if (success) {
             data->copied_count++;
+            data->stats.file_times.push_back(file_time);
         }
-        log_operation_locked(current_file, success, exec_time);
-
-        pthread_mutex_unlock(&data->global_mutex);
+        
+        pthread_mutex_unlock(&data->queue_mutex);
     }
-
+    
     return nullptr;
 }
 
@@ -169,20 +162,131 @@ bool create_directory(const std::string& path) {
     return true;
 }
 
+bool run_sequential(SharedData* data) {
+    data->head_index = 0;
+    data->stop = false;
+    data->stats.total_time = 0.0;
+    data->stats.processed_count = 0;
+    data->copied_count = 0;
+    data->stats.file_times.clear();
+    
+    double start_total = get_time_ms();
+    
+    for (size_t i = 0; i < data->files.size(); ++i) {
+        double start_file = get_time_ms();
+        bool success = process_file(data->files[i], data->output_dir, data);
+        double end_file = get_time_ms();
+        double file_time = end_file - start_file;
+        
+        if (success) {
+            data->stats.processed_count++;
+            data->copied_count++;
+            data->stats.file_times.push_back(file_time);
+        }
+    }
+    
+    double end_total = get_time_ms();
+    data->stats.total_time = end_total - start_total;
+    
+    if (data->stats.processed_count > 0) {
+        data->stats.avg_time_per_file = data->stats.total_time / data->stats.processed_count;
+    }
+    
+    return true;
+}
+
+bool run_parallel(SharedData* data) {
+    data->head_index = 0;
+    data->tail_index = data->files.size();
+    data->stop = false;
+    data->copied_count = 0;
+    data->stats.file_times.clear();
+    data->stats.processed_count = 0;
+    
+    pthread_mutex_init(&data->queue_mutex, nullptr);
+    pthread_cond_init(&data->queue_cond, nullptr);
+    
+    double start_total = get_time_ms();
+    
+    pthread_t threads[WORKERS_COUNT];
+    for (int i = 0; i < WORKERS_COUNT; ++i) {
+        if (pthread_create(&threads[i], nullptr, worker_thread, data) != 0) {
+            std::cerr << "Error: Failed to create thread " << i << "\n";
+            return false;
+        }
+    }
+    
+    pthread_mutex_lock(&data->queue_mutex);
+    data->stop = true;
+    pthread_cond_broadcast(&data->queue_cond);
+    pthread_mutex_unlock(&data->queue_mutex);
+    
+    for (int i = 0; i < WORKERS_COUNT; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+    
+    double end_total = get_time_ms();
+    data->stats.total_time = end_total - start_total;
+    data->stats.processed_count = data->copied_count;
+    
+    if (data->stats.processed_count > 0) {
+        data->stats.avg_time_per_file = data->stats.total_time / data->stats.processed_count;
+    }
+    
+    pthread_mutex_destroy(&data->queue_mutex);
+    pthread_cond_destroy(&data->queue_cond);
+    
+    return true;
+}
+
+void print_stats(const std::string& mode_name, const Stats& stats) {
+    std::cout << "\n========== " << mode_name << " Statistics ==========\n";
+    std::cout << "Total execution time: " << std::fixed << std::setprecision(3) 
+              << stats.total_time << " ms\n";
+    std::cout << "Average time per file: " << std::fixed << std::setprecision(3) 
+              << stats.avg_time_per_file << " ms\n";
+    std::cout << "Files processed: " << stats.processed_count << "\n";
+    std::cout << "=======================================\n";
+}
+
+ProcessMode parse_mode_arg(const std::string& arg) {
+    if (arg == "--mode=sequential") return MODE_SEQUENTIAL;
+    if (arg == "--mode=parallel") return MODE_PARALLEL;
+    if (arg == "--mode=auto") return MODE_AUTO;
+    return MODE_AUTO;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " file1.txt [file2.txt ...] output_dir key\n";
+        std::cerr << "Usage: " << argv[0] 
+                  << " [--mode=sequential|--mode=parallel|--mode=auto] "
+                  << "file1.txt [file2.txt ...] output_dir key\n";
         return 1;
     }
 
-    std::string output_dir = argv[argc - 2];
-    std::string key_str = argv[argc - 1];
-    int encryption_key = std::atoi(key_str.c_str());
-
+    ProcessMode mode = MODE_AUTO;
+    int key = 1;
+    std::string output_dir;
     std::vector<std::string> input_files;
-    for (int i = 1; i < argc - 2; ++i) {
-        input_files.push_back(argv[i]);
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.substr(0, 7) == "--mode=") {
+            mode = parse_mode_arg(arg);
+        } else if (arg == "-k" && i + 1 < argc) {
+            key = std::atoi(argv[++i]);
+        }
     }
+
+    for (int i = 1; i < argc - 2; ++i) {
+        struct stat st;
+        if (stat(argv[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            input_files.push_back(argv[i]);
+        }
+    }
+
+    output_dir = argv[argc - 2];
+    key = std::atoi(argv[argc - 1]);
 
     if (input_files.empty()) {
         std::cerr << "Error: No input files specified\n";
@@ -191,6 +295,16 @@ int main(int argc, char *argv[]) {
 
     if (!create_directory(output_dir)) {
         return 1;
+    }
+
+    ProcessMode selected_mode = mode;
+
+    if (mode == MODE_AUTO) {
+        if (input_files.size() < 5) {
+            selected_mode = MODE_SEQUENTIAL;
+        } else {
+            selected_mode = MODE_PARALLEL;
+        }
     }
 
     void* handle = dlopen(LIB_PATH, RTLD_NOW);
@@ -214,38 +328,72 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    *lib_key = static_cast<unsigned char>(encryption_key);
+    *lib_key = static_cast<unsigned char>(key);
 
-    g_data.files = input_files;
-    g_data.next_file_index = 0;
-    g_data.copied_count = 0;
-    g_data.output_dir = output_dir;
-    g_data.encryption_key = encryption_key;
-    g_data.lib_handle = handle;
-    g_data.lib_key = lib_key;
-    g_data.cipher = cipher;
+    SharedData data;
+    data.files = input_files;
+    data.output_dir = output_dir;
+    data.encryption_key = key;
+    data.lib_handle = handle;
+    data.lib_key = lib_key;
+    data.cipher = cipher;
+    data.copied_count = 0;
 
-    pthread_mutex_init(&g_data.global_mutex, nullptr);
+    double seq_time = 0, par_time = 0;
 
-    pthread_t threads[NUM_WORKER_THREADS];
-    std::cout << "Starting " << NUM_WORKER_THREADS << " worker threads...\n";
-    
-    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
-        if (pthread_create(&threads[i], nullptr, worker_thread, &g_data) != 0) {
-            std::cerr << "Error: Failed to create thread " << i << "\n";
-            return 1;
+    if (selected_mode == MODE_SEQUENTIAL) {
+        std::cout << "Running in SEQUENTIAL mode (" << input_files.size() << " files)\n";
+        data.head_index = 0;
+        data.stop = false;
+        data.copied_count = 0;
+        run_sequential(&data);
+        seq_time = data.stats.total_time;
+        print_stats("SEQUENTIAL", data.stats);
+    } else if (selected_mode == MODE_PARALLEL) {
+        std::cout << "Running in PARALLEL mode (" << input_files.size() 
+                 << " files, " << WORKERS_COUNT << " workers)\n";
+        data.head_index = 0;
+        data.stop = false;
+        data.copied_count = 0;
+        run_parallel(&data);
+        par_time = data.stats.total_time;
+        print_stats("PARALLEL", data.stats);
+    }
+
+    if (mode == MODE_AUTO) {
+        std::cout << "Running in " << (selected_mode == MODE_SEQUENTIAL ? "PARALLEL" : "SEQUENTIAL") 
+                  << " mode to compare...\n";
+        
+        if (selected_mode == MODE_SEQUENTIAL) {
+            data.head_index = 0;
+            data.stop = false;
+            data.copied_count = 0;
+            run_parallel(&data);
+            par_time = data.stats.total_time;
+            print_stats("PARALLEL (comparison)", data.stats);
+        } else {
+            data.head_index = 0;
+            data.stop = false;
+            data.copied_count = 0;
+            run_sequential(&data);
+            seq_time = data.stats.total_time;
+            print_stats("SEQUENTIAL (comparison)", data.stats);
         }
+
+        std::cout << "\n========== Comparison ==========\n";
+        std::cout << "Selected mode: " 
+                 << (selected_mode == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL") << "\n";
+        std::cout << "Because: file count (" << input_files.size() 
+                 << ") " << (input_files.size() < 5 ? "<" : ">=") << " 5\n";
+        std::cout << "Sequential time: " << std::fixed << std::setprecision(3) 
+                  << seq_time << " ms\n";
+        std::cout << "Parallel time: " << std::fixed << std::setprecision(3) 
+                  << par_time << " ms\n";
+        std::cout << "Speedup: " << std::fixed << std::setprecision(2) 
+                  << (par_time > 0 ? seq_time / par_time : 0) << "x\n";
+        std::cout << "================================\n";
     }
 
-    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
-        pthread_join(threads[i], nullptr);
-    }
-
-    std::cout << "\nProcessing completed.\n";
-    std::cout << "Total files copied: " << g_data.copied_count << " / " << input_files.size() << "\n";
-    std::cout << "Check log.txt for details.\n";
-
-    pthread_mutex_destroy(&g_data.global_mutex);
     dlclose(handle);
 
     return 0;
