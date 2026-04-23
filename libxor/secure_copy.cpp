@@ -280,7 +280,7 @@ int main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc - 2; ++i) {
         struct stat st;
-        if (stat(argv[i], &st) == 0 && S_ISREG(st.st_mode)) {
+        if (stat(argv[i], &st) == 0 && (S_ISREG(st.st_mode) || S_ISCHR(st.st_mode))) {
             input_files.push_back(argv[i]);
         }
     }
