@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 void cipher(void *src, void *dst, int len);
+void set_key(unsigned char k);
+void probe_attack(void);
 
 #ifdef __cplusplus
 }

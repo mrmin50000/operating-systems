@@ -46,7 +46,6 @@ struct SharedData {
     std::string output_dir;
     int encryption_key;
     void* lib_handle;
-    unsigned char* lib_key;
     typedef void (*cipher_func_t)(void*, void*, int);
     cipher_func_t cipher;
     Stats stats;
@@ -313,13 +312,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    unsigned char* lib_key = reinterpret_cast<unsigned char*>(dlsym(handle, "key"));
-    if (!lib_key) {
-        std::cerr << "Error: Not found 'key' in lib: " << dlerror() << "\n";
-        dlclose(handle);
-        return 1;
-    }
-
     typedef void (*cipher_func_t)(void*, void*, int);
     cipher_func_t cipher = reinterpret_cast<cipher_func_t>(dlsym(handle, "cipher"));
     if (!cipher) {
@@ -328,14 +320,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    *lib_key = static_cast<unsigned char>(key);
+    typedef void (*set_key_func_t)(unsigned char);
+    set_key_func_t set_key = reinterpret_cast<set_key_func_t>(dlsym(handle, "set_key"));
+    if (!set_key) {
+        std::cerr << "Error: not found 'set_key' in lib: " << dlerror() << "\n";
+        dlclose(handle);
+        return 1;
+    }
+
+    set_key(static_cast<unsigned char>(key));
 
     SharedData data;
     data.files = input_files;
     data.output_dir = output_dir;
     data.encryption_key = key;
     data.lib_handle = handle;
-    data.lib_key = lib_key;
     data.cipher = cipher;
     data.copied_count = 0;
 

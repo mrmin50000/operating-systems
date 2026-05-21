@@ -28,13 +28,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    unsigned char *lib_key = reinterpret_cast<unsigned char*>(dlsym(handle, "key"));
-    if (!lib_key) {
-        std::cerr << "Error: Not found 'key' in lib: " << dlerror() << "\n";
-        dlclose(handle);
-        return 1;
-    }
-
     cipher_func_t cipher = reinterpret_cast<cipher_func_t>(dlsym(handle, "cipher"));
     if (!cipher) {
         std::cerr << "Error: not found 'cipher' in lib: " << dlerror() << "\n";
@@ -42,7 +35,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    *lib_key = static_cast<unsigned char>(key);
+    typedef void (*set_key_func_t)(unsigned char);
+    set_key_func_t set_key = reinterpret_cast<set_key_func_t>(dlsym(handle, "set_key"));
+    if (!set_key) {
+        std::cerr << "Error: not found 'set_key' in lib: " << dlerror() << "\n";
+        dlclose(handle);
+        return 1;
+    }
+
+    set_key(static_cast<unsigned char>(key));
 
     std::ifstream src(src_file, std::ios::binary | std::ios::ate);
     if (!src) {
