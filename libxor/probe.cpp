@@ -20,10 +20,10 @@ int main() {
     }
 
     set_key(42);
-    std::cerr << "Triggering probe_attack() — SIGSEGV expected, program should die...\n";
+    std::cerr << "Triggering probe_attack() — writing to PROT_READ page, SIGSEGV expected...\n";
     probe_attack();
 
-    std::cerr << "ERROR: probe_attack() returned — key page was readable!\n";
+    std::cerr << "ERROR: probe_attack() returned — write to protected page succeeded!\n";
     dlclose(handle);
     return 1;
 }
