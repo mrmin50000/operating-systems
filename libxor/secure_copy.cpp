@@ -1,399 +1,480 @@
-#define _POSIX_C_SOURCE 200809L
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <cstring>
 #include <cstdlib>
-#include <unistd.h>
+#include <cstdint>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <ctime>
-#include <errno.h>
-#include <iomanip>
-#include <sstream>
+#include <dirent.h>
+#include <algorithm>
+#include <unistd.h>
+#include <fcntl.h>
 
-#ifndef WORKERS_COUNT
-#define WORKERS_COUNT 4
-#endif
-
-const size_t BUFFER_SIZE = 4096;
+const int MAX_THREADS = 5;
+const int SALT_SIZE = 16;
 const char* LIB_PATH = "./libxor.so";
 
-enum ProcessMode {
-    MODE_SEQUENTIAL,
-    MODE_PARALLEL,
-    MODE_AUTO
+#pragma pack(push, 1)
+struct ImageRecord {
+    uint32_t file_len;
+    uint32_t name_len;
+    unsigned char salt[SALT_SIZE];
+};
+#pragma pack(pop)
+
+typedef void (*set_master_key_func_t)(const unsigned char*, int);
+typedef void (*rc4_encrypt_func_t)(unsigned char*, int, const unsigned char*, int);
+
+struct Args {
+    bool add = false;
+    bool list = false;
+    bool get = false;
+    std::string key;
+    std::string image;
+    std::string out;
+    std::vector<std::string> paths;
+    std::string get_filename;
 };
 
-struct Stats {
-    double total_time;
-    double avg_time_per_file;
-    int processed_count;
-    std::vector<double> file_times;
+struct AddJob {
+    std::string file_path;
+    std::string rel_name;
 };
 
-struct SharedData {
+struct AddData {
+    std::vector<AddJob> jobs;
+    std::string image_path;
     pthread_mutex_t queue_mutex;
+    pthread_mutex_t image_mutex;
     pthread_cond_t queue_cond;
-    std::vector<std::string> files;
     size_t head_index;
-    size_t tail_index;
     bool stop;
-    int copied_count;
-    std::string output_dir;
-    int encryption_key;
-    void* lib_handle;
-    typedef void (*cipher_func_t)(void*, void*, int);
-    cipher_func_t cipher;
-    Stats stats;
+    rc4_encrypt_func_t rc4_encrypt;
+    int errors;
+    int added;
 };
 
-int safe_lock_mutex(pthread_mutex_t* mutex, int timeout_sec) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += timeout_sec;
-    int ret = pthread_mutex_timedlock(mutex, &ts);
-    if (ret == ETIMEDOUT) {
-        std::cerr << "\n[WARNING] Possible deadlock: thread waits for mutex more than " 
-                  << timeout_sec << " seconds!\n";
-        return -1;
-    } else if (ret != 0) {
-        std::cerr << "\n[ERROR] Mutex lock error: " << strerror(ret) << "\n";
-        return -1;
+static void collect_files(const std::string &dir_path, const std::string &base,
+                          std::vector<AddJob> &jobs) {
+    DIR *dir = opendir(dir_path.c_str());
+    if (!dir) {
+        std::cerr << "Error: cannot open directory " << dir_path << "\n";
+        return;
     }
-    return 0;
-}
-
-bool process_file(const std::string& input_path, const std::string& output_dir, 
-                  SharedData* data) {
-    size_t pos = input_path.find_last_of("/\\");
-    std::string filename = (pos != std::string::npos) ? input_path.substr(pos + 1) : input_path;
-    std::string output_path = output_dir + "/" + filename;
-
-    std::ifstream src(input_path, std::ios::binary);
-    if (!src) {
-        return false;
-    }
-
-    std::ofstream dst(output_path, std::ios::binary);
-    if (!dst) {
-        return false;
-    }
-
-    std::vector<char> buffer(BUFFER_SIZE);
-    std::vector<char> enc_buffer(BUFFER_SIZE);
-
-    while (src) {
-        src.read(buffer.data(), BUFFER_SIZE);
-        std::streamsize bytes_read = src.gcount();
-        if (bytes_read > 0) {
-            data->cipher(buffer.data(), enc_buffer.data(), static_cast<int>(bytes_read));
-            dst.write(enc_buffer.data(), bytes_read);
-            if (!dst) return false;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        std::string full = dir_path + "/" + entry->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) continue;
+        std::string rel = base + "/" + entry->d_name;
+        if (S_ISDIR(st.st_mode)) {
+            collect_files(full, rel, jobs);
+        } else if (S_ISREG(st.st_mode)) {
+            jobs.push_back({full, rel});
         }
     }
+    closedir(dir);
+}
 
-    src.close();
-    dst.close();
+static bool write_record(std::ofstream &img, const std::string &name,
+                         const unsigned char *salt,
+                         const unsigned char *content, uint32_t content_len) {
+    uint32_t name_len = (uint32_t)name.size();
+    ImageRecord rec;
+    rec.file_len = content_len;
+    rec.name_len = name_len;
+    memcpy(rec.salt, salt, SALT_SIZE);
+
+    img.write((const char*)&rec, sizeof(rec));
+    if (!img) return false;
+    img.write(name.data(), name_len);
+    if (!img) return false;
+    img.write((const char*)content, content_len);
+    if (!img) return false;
     return true;
 }
 
-double get_time_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+static bool read_record(std::ifstream &img, std::string &name,
+                        std::vector<unsigned char> &salt,
+                        std::vector<unsigned char> &content) {
+    ImageRecord rec;
+    img.read((char*)&rec, sizeof(rec));
+    if (img.gcount() == 0) return false;
+    if (img.gcount() != sizeof(rec)) return false;
+
+    name.resize(rec.name_len);
+    img.read(&name[0], rec.name_len);
+    if ((size_t)img.gcount() != rec.name_len) return false;
+
+    content.resize(rec.file_len);
+    img.read((char*)content.data(), rec.file_len);
+    if ((size_t)img.gcount() != rec.file_len) return false;
+
+    salt.resize(SALT_SIZE);
+    memcpy(salt.data(), rec.salt, SALT_SIZE);
+
+    return true;
 }
 
-void* worker_thread(void* arg) {
-    SharedData* data = (SharedData*)arg;
-    
+static void* add_worker(void *arg) {
+    AddData *data = (AddData*)arg;
+    std::vector<char> buf;
+    buf.reserve(65536);
+
     while (true) {
-        std::string current_file;
-        
         pthread_mutex_lock(&data->queue_mutex);
-        
-        while (data->head_index >= data->files.size() && !data->stop) {
+        while (data->head_index >= data->jobs.size() && !data->stop) {
             pthread_cond_wait(&data->queue_cond, &data->queue_mutex);
         }
-        
-        if (data->head_index >= data->files.size() && data->stop) {
+        if (data->head_index >= data->jobs.size() && data->stop) {
             pthread_mutex_unlock(&data->queue_mutex);
             break;
         }
-        
-        current_file = data->files[data->head_index];
+        AddJob job = data->jobs[data->head_index];
         data->head_index++;
-        
         pthread_mutex_unlock(&data->queue_mutex);
-        
-        double start_time = get_time_ms();
-        bool success = process_file(current_file, data->output_dir, data);
-        double end_time = get_time_ms();
-        double file_time = end_time - start_time;
-        
-        pthread_mutex_lock(&data->queue_mutex);
-        
-        if (success) {
-            data->copied_count++;
-            data->stats.file_times.push_back(file_time);
+
+        // Read file
+        std::ifstream src(job.file_path, std::ios::binary);
+        if (!src) {
+            std::cerr << "Error: cannot read " << job.file_path << "\n";
+            __sync_fetch_and_add(&data->errors, 1);
+            continue;
         }
-        
-        pthread_mutex_unlock(&data->queue_mutex);
+        src.seekg(0, std::ios::end);
+        size_t file_size = src.tellg();
+        src.seekg(0, std::ios::beg);
+        buf.resize(file_size);
+        src.read(buf.data(), file_size);
+        if ((size_t)src.gcount() != file_size) {
+            std::cerr << "Error: short read " << job.file_path << "\n";
+            __sync_fetch_and_add(&data->errors, 1);
+            continue;
+        }
+        src.close();
+
+        // Generate salt
+        unsigned char salt[SALT_SIZE];
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd < 0 || read(fd, salt, SALT_SIZE) != SALT_SIZE) {
+            std::cerr << "Error: cannot generate salt\n";
+            if (fd >= 0) close(fd);
+            __sync_fetch_and_add(&data->errors, 1);
+            continue;
+        }
+        close(fd);
+
+        // Encrypt (master_key already set by do_add)
+        data->rc4_encrypt((unsigned char*)buf.data(), (int)file_size, salt, SALT_SIZE);
+
+        // Write to image
+        pthread_mutex_lock(&data->image_mutex);
+        std::ofstream img(data->image_path,
+                          std::ios::binary | std::ios::app);
+        if (!img) {
+            std::cerr << "Error: cannot open image " << data->image_path << "\n";
+            pthread_mutex_unlock(&data->image_mutex);
+            __sync_fetch_and_add(&data->errors, 1);
+            continue;
+        }
+        bool ok = write_record(img, job.rel_name, salt,
+                               (unsigned char*)buf.data(), (uint32_t)file_size);
+        img.close();
+        pthread_mutex_unlock(&data->image_mutex);
+
+        if (!ok) {
+            std::cerr << "Error: cannot write " << job.rel_name << " to image\n";
+            __sync_fetch_and_add(&data->errors, 1);
+            continue;
+        }
+        __sync_fetch_and_add(&data->added, 1);
+        std::cout << "  added " << job.rel_name << " (" << file_size << " bytes)\n";
     }
-    
     return nullptr;
 }
 
-bool create_directory(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        if (mkdir(path.c_str(), 0777) != 0) {
-            std::cerr << "Error: Cannot create directory " << path << "\n";
-            return false;
+static bool do_add(Args &args) {
+    std::vector<AddJob> jobs;
+    for (const auto &p : args.paths) {
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0) {
+            std::cerr << "Error: path not found " << p << "\n";
+            continue;
         }
-    } else if (!S_ISDIR(st.st_mode)) {
-        std::cerr << "Error: " << path << " exists but is not a directory\n";
+        if (S_ISDIR(st.st_mode)) {
+            collect_files(p, p, jobs);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t pos = p.find_last_of("/\\");
+            std::string name = (pos != std::string::npos) ? p.substr(pos + 1) : p;
+            jobs.push_back({p, name});
+        }
+    }
+
+    if (jobs.empty()) {
+        std::cerr << "Error: no files to add\n";
         return false;
     }
-    return true;
-}
 
-bool run_sequential(SharedData* data) {
-    data->head_index = 0;
-    data->stop = false;
-    data->stats.total_time = 0.0;
-    data->stats.processed_count = 0;
-    data->copied_count = 0;
-    data->stats.file_times.clear();
-    
-    double start_total = get_time_ms();
-    
-    for (size_t i = 0; i < data->files.size(); ++i) {
-        double start_file = get_time_ms();
-        bool success = process_file(data->files[i], data->output_dir, data);
-        double end_file = get_time_ms();
-        double file_time = end_file - start_file;
-        
-        if (success) {
-            data->stats.processed_count++;
-            data->copied_count++;
-            data->stats.file_times.push_back(file_time);
-        }
+    // Open image for append (create if doesn't exist)
+    bool exists = (access(args.image.c_str(), F_OK) == 0);
+    std::ofstream img(args.image, std::ios::binary | std::ios::app);
+    if (!img) {
+        std::cerr << "Error: cannot create/open image " << args.image << "\n";
+        return false;
     }
-    
-    double end_total = get_time_ms();
-    data->stats.total_time = end_total - start_total;
-    
-    if (data->stats.processed_count > 0) {
-        data->stats.avg_time_per_file = data->stats.total_time / data->stats.processed_count;
-    }
-    
-    return true;
-}
+    img.close();
 
-bool run_parallel(SharedData* data) {
-    data->head_index = 0;
-    data->tail_index = data->files.size();
-    data->stop = false;
-    data->copied_count = 0;
-    data->stats.file_times.clear();
-    data->stats.processed_count = 0;
-    
-    pthread_mutex_init(&data->queue_mutex, nullptr);
-    pthread_cond_init(&data->queue_cond, nullptr);
-    
-    double start_total = get_time_ms();
-    
-    pthread_t threads[WORKERS_COUNT];
-    for (int i = 0; i < WORKERS_COUNT; ++i) {
-        if (pthread_create(&threads[i], nullptr, worker_thread, data) != 0) {
-            std::cerr << "Error: Failed to create thread " << i << "\n";
-            return false;
-        }
+    // Load libxor and get function pointers
+    void *handle = dlopen(LIB_PATH, RTLD_NOW);
+    if (!handle) {
+        std::cerr << "Error: " << dlerror() << "\n";
+        return false;
     }
-    
-    pthread_mutex_lock(&data->queue_mutex);
-    data->stop = true;
-    pthread_cond_broadcast(&data->queue_cond);
-    pthread_mutex_unlock(&data->queue_mutex);
-    
-    for (int i = 0; i < WORKERS_COUNT; ++i) {
+
+    auto set_master_key = (set_master_key_func_t)dlsym(handle, "set_master_key");
+    auto rc4_encrypt = (rc4_encrypt_func_t)dlsym(handle, "rc4_encrypt");
+    if (!set_master_key || !rc4_encrypt) {
+        std::cerr << "Error: symbols not found in " << LIB_PATH << "\n";
+        dlclose(handle);
+        return false;
+    }
+
+    set_master_key((const unsigned char*)args.key.data(), (int)args.key.size());
+
+    AddData data;
+    data.jobs = std::move(jobs);
+    data.image_path = args.image;
+    data.head_index = 0;
+    data.stop = false;
+    data.rc4_encrypt = rc4_encrypt;
+    data.errors = 0;
+    data.added = 0;
+
+    pthread_mutex_init(&data.queue_mutex, nullptr);
+    pthread_mutex_init(&data.image_mutex, nullptr);
+    pthread_cond_init(&data.queue_cond, nullptr);
+
+    int thread_count = data.jobs.size() < (size_t)MAX_THREADS
+                       ? (int)data.jobs.size() : MAX_THREADS;
+
+    std::cout << "Adding " << data.jobs.size() << " file(s) with "
+              << thread_count << " thread(s)...\n";
+
+    std::vector<pthread_t> threads(thread_count);
+    for (int i = 0; i < thread_count; i++) {
+        pthread_create(&threads[i], nullptr, add_worker, &data);
+    }
+
+    pthread_mutex_lock(&data.queue_mutex);
+    data.stop = true;
+    pthread_cond_broadcast(&data.queue_cond);
+    pthread_mutex_unlock(&data.queue_mutex);
+
+    for (int i = 0; i < thread_count; i++) {
         pthread_join(threads[i], nullptr);
     }
-    
-    double end_total = get_time_ms();
-    data->stats.total_time = end_total - start_total;
-    data->stats.processed_count = data->copied_count;
-    
-    if (data->stats.processed_count > 0) {
-        data->stats.avg_time_per_file = data->stats.total_time / data->stats.processed_count;
-    }
-    
-    pthread_mutex_destroy(&data->queue_mutex);
-    pthread_cond_destroy(&data->queue_cond);
-    
-    return true;
-}
 
-void print_stats(const std::string& mode_name, const Stats& stats) {
-    std::cout << "\n========== " << mode_name << " Statistics ==========\n";
-    std::cout << "Total execution time: " << std::fixed << std::setprecision(3) 
-              << stats.total_time << " ms\n";
-    std::cout << "Average time per file: " << std::fixed << std::setprecision(3) 
-              << stats.avg_time_per_file << " ms\n";
-    std::cout << "Files processed: " << stats.processed_count << "\n";
-    std::cout << "=======================================\n";
-}
-
-ProcessMode parse_mode_arg(const std::string& arg) {
-    if (arg == "--mode=sequential") return MODE_SEQUENTIAL;
-    if (arg == "--mode=parallel") return MODE_PARALLEL;
-    if (arg == "--mode=auto") return MODE_AUTO;
-    return MODE_AUTO;
-}
-
-int main(int argc, char *argv[]) {
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] 
-                  << " [--mode=sequential|--mode=parallel|--mode=auto] "
-                  << "file1.txt [file2.txt ...] output_dir key\n";
-        return 1;
-    }
-
-    ProcessMode mode = MODE_AUTO;
-    int key = 1;
-    std::string output_dir;
-    std::vector<std::string> input_files;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg.substr(0, 7) == "--mode=") {
-            mode = parse_mode_arg(arg);
-        } else if (arg == "-k" && i + 1 < argc) {
-            key = std::atoi(argv[++i]);
-        }
-    }
-
-    for (int i = 1; i < argc - 2; ++i) {
-        struct stat st;
-        if (stat(argv[i], &st) == 0 && (S_ISREG(st.st_mode) || S_ISCHR(st.st_mode))) {
-            input_files.push_back(argv[i]);
-        }
-    }
-
-    output_dir = argv[argc - 2];
-    key = std::atoi(argv[argc - 1]);
-
-    if (input_files.empty()) {
-        std::cerr << "Error: No input files specified\n";
-        return 1;
-    }
-
-    if (!create_directory(output_dir)) {
-        return 1;
-    }
-
-    ProcessMode selected_mode = mode;
-
-    if (mode == MODE_AUTO) {
-        if (input_files.size() < 5) {
-            selected_mode = MODE_SEQUENTIAL;
-        } else {
-            selected_mode = MODE_PARALLEL;
-        }
-    }
-
-    void* handle = dlopen(LIB_PATH, RTLD_NOW);
-    if (!handle) {
-        std::cerr << "Lib download error: " << dlerror() << "\n";
-        return 1;
-    }
-
-    typedef void (*cipher_func_t)(void*, void*, int);
-    cipher_func_t cipher = reinterpret_cast<cipher_func_t>(dlsym(handle, "cipher"));
-    if (!cipher) {
-        std::cerr << "Error: not found 'cipher' in lib: " << dlerror() << "\n";
-        dlclose(handle);
-        return 1;
-    }
-
-    typedef void (*set_key_func_t)(unsigned char);
-    set_key_func_t set_key = reinterpret_cast<set_key_func_t>(dlsym(handle, "set_key"));
-    if (!set_key) {
-        std::cerr << "Error: not found 'set_key' in lib: " << dlerror() << "\n";
-        dlclose(handle);
-        return 1;
-    }
-
-    set_key(static_cast<unsigned char>(key));
-
-    SharedData data;
-    data.files = input_files;
-    data.output_dir = output_dir;
-    data.encryption_key = key;
-    data.lib_handle = handle;
-    data.cipher = cipher;
-    data.copied_count = 0;
-
-    double seq_time = 0, par_time = 0;
-
-    if (selected_mode == MODE_SEQUENTIAL) {
-        std::cout << "Running in SEQUENTIAL mode (" << input_files.size() << " files)\n";
-        data.head_index = 0;
-        data.stop = false;
-        data.copied_count = 0;
-        run_sequential(&data);
-        seq_time = data.stats.total_time;
-        print_stats("SEQUENTIAL", data.stats);
-    } else if (selected_mode == MODE_PARALLEL) {
-        std::cout << "Running in PARALLEL mode (" << input_files.size() 
-                 << " files, " << WORKERS_COUNT << " workers)\n";
-        data.head_index = 0;
-        data.stop = false;
-        data.copied_count = 0;
-        run_parallel(&data);
-        par_time = data.stats.total_time;
-        print_stats("PARALLEL", data.stats);
-    }
-
-    if (mode == MODE_AUTO) {
-        std::cout << "Running in " << (selected_mode == MODE_SEQUENTIAL ? "PARALLEL" : "SEQUENTIAL") 
-                  << " mode to compare...\n";
-        
-        if (selected_mode == MODE_SEQUENTIAL) {
-            data.head_index = 0;
-            data.stop = false;
-            data.copied_count = 0;
-            run_parallel(&data);
-            par_time = data.stats.total_time;
-            print_stats("PARALLEL (comparison)", data.stats);
-        } else {
-            data.head_index = 0;
-            data.stop = false;
-            data.copied_count = 0;
-            run_sequential(&data);
-            seq_time = data.stats.total_time;
-            print_stats("SEQUENTIAL (comparison)", data.stats);
-        }
-
-        std::cout << "\n========== Comparison ==========\n";
-        std::cout << "Selected mode: " 
-                 << (selected_mode == MODE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL") << "\n";
-        std::cout << "Because: file count (" << input_files.size() 
-                 << ") " << (input_files.size() < 5 ? "<" : ">=") << " 5\n";
-        std::cout << "Sequential time: " << std::fixed << std::setprecision(3) 
-                  << seq_time << " ms\n";
-        std::cout << "Parallel time: " << std::fixed << std::setprecision(3) 
-                  << par_time << " ms\n";
-        std::cout << "Speedup: " << std::fixed << std::setprecision(2) 
-                  << (par_time > 0 ? seq_time / par_time : 0) << "x\n";
-        std::cout << "================================\n";
-    }
+    pthread_mutex_destroy(&data.queue_mutex);
+    pthread_mutex_destroy(&data.image_mutex);
+    pthread_cond_destroy(&data.queue_cond);
 
     dlclose(handle);
 
-    return 0;
+    std::cout << "Done: " << data.added << " added, "
+              << data.errors << " errors\n";
+    return data.errors == 0;
+}
+
+static int compare_records(const void *a, const void *b) {
+    const std::pair<std::string, uint32_t> *pa = (const std::pair<std::string, uint32_t>*)a;
+    const std::pair<std::string, uint32_t> *pb = (const std::pair<std::string, uint32_t>*)b;
+    return pa->first.compare(pb->first);
+}
+
+static bool do_list(Args &args) {
+    std::ifstream img(args.image, std::ios::binary);
+    if (!img) {
+        std::cerr << "Error: cannot open image " << args.image << "\n";
+        return false;
+    }
+
+    std::vector<std::pair<std::string, uint32_t>> entries;
+
+    while (true) {
+        std::string name;
+        std::vector<unsigned char> salt, content;
+        if (!read_record(img, name, salt, content)) break;
+        entries.push_back({name, (uint32_t)content.size()});
+    }
+
+    img.close();
+
+    if (entries.empty()) {
+        std::cout << "(empty image)\n";
+        return true;
+    }
+
+    std::sort(entries.begin(), entries.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+
+    std::cout << "Files in image:\n";
+    for (const auto &e : entries) {
+        std::cout << "  " << e.first << "  " << e.second << " bytes\n";
+    }
+
+    return true;
+}
+
+static bool do_get(Args &args) {
+    std::ifstream img(args.image, std::ios::binary);
+    if (!img) {
+        std::cerr << "Error: cannot open image " << args.image << "\n";
+        return false;
+    }
+
+    // Find file in image
+    std::string found_name;
+    std::vector<unsigned char> found_salt, found_content;
+
+    while (true) {
+        std::string name;
+        std::vector<unsigned char> salt, content;
+        if (!read_record(img, name, salt, content)) break;
+        if (name == args.get_filename) {
+            found_name = name;
+            found_salt = std::move(salt);
+            found_content = std::move(content);
+            break;
+        }
+    }
+    img.close();
+
+    if (found_name.empty()) {
+        std::cerr << "Error: file '" << args.get_filename << "' not found in image\n";
+        return false;
+    }
+
+    // Decrypt
+    void *handle = dlopen(LIB_PATH, RTLD_NOW);
+    if (!handle) {
+        std::cerr << "Error: " << dlerror() << "\n";
+        return false;
+    }
+
+    auto set_master_key = (set_master_key_func_t)dlsym(handle, "set_master_key");
+    auto rc4_encrypt = (rc4_encrypt_func_t)dlsym(handle, "rc4_encrypt");
+    if (!set_master_key || !rc4_encrypt) {
+        std::cerr << "Error: symbols not found\n";
+        dlclose(handle);
+        return false;
+    }
+
+    // RC4 decrypt is same as encrypt (XOR with same keystream)
+    set_master_key((const unsigned char*)args.key.data(), (int)args.key.size());
+    rc4_encrypt(found_content.data(), (int)found_content.size(),
+                found_salt.data(), SALT_SIZE);
+
+    dlclose(handle);
+
+    // Write output
+    std::ofstream out(args.out, std::ios::binary);
+    if (!out) {
+        std::cerr << "Error: cannot create " << args.out << "\n";
+        return false;
+    }
+    out.write((const char*)found_content.data(), found_content.size());
+    out.close();
+
+    std::cout << "Extracted " << found_name << " (" << found_content.size()
+              << " bytes) -> " << args.out << "\n";
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage:\n"
+                  << "  " << argv[0] << " -add -key \"secret\" -image disk.img file1 [file2...]\n"
+                  << "  " << argv[0] << " -list -image disk.img\n"
+                  << "  " << argv[0] << " -get -image disk.img -key \"secret\" -out file file_name\n";
+        return 1;
+    }
+
+    Args args;
+    int i = 1;
+
+    if (std::string(argv[i]) == "-add") {
+        args.add = true;
+        i++;
+    } else if (std::string(argv[i]) == "-list") {
+        args.list = true;
+        i++;
+    } else if (std::string(argv[i]) == "-get") {
+        args.get = true;
+        i++;
+    } else {
+        std::cerr << "Error: unknown command '" << argv[i] << "'\n";
+        return 1;
+    }
+
+    while (i < argc) {
+        std::string arg = argv[i];
+        if (arg == "-key" && i + 1 < argc) {
+            args.key = argv[++i];
+        } else if (arg == "-image" && i + 1 < argc) {
+            args.image = argv[++i];
+        } else if (arg == "-out" && i + 1 < argc) {
+            args.out = argv[++i];
+        } else {
+            break;
+        }
+        i++;
+    }
+
+    if (args.image.empty()) {
+        std::cerr << "Error: -image is required\n";
+        return 1;
+    }
+
+    if (args.add) {
+        if (args.key.empty()) {
+            std::cerr << "Error: -key is required for -add\n";
+            return 1;
+        }
+        for (; i < argc; i++)
+            args.paths.push_back(argv[i]);
+        if (args.paths.empty()) {
+            std::cerr << "Error: no files to add\n";
+            return 1;
+        }
+        return do_add(args) ? 0 : 1;
+    }
+
+    if (args.list) {
+        return do_list(args) ? 0 : 1;
+    }
+
+    if (args.get) {
+        if (args.key.empty()) {
+            std::cerr << "Error: -key is required for -get\n";
+            return 1;
+        }
+        if (args.out.empty()) {
+            std::cerr << "Error: -out is required for -get\n";
+            return 1;
+        }
+        if (i >= argc) {
+            std::cerr << "Error: file_name is required for -get\n";
+            return 1;
+        }
+        args.get_filename = argv[i];
+        return do_get(args) ? 0 : 1;
+    }
+
+    std::cerr << "Error: no command specified\n";
+    return 1;
 }
