@@ -25,8 +25,7 @@ struct ImageRecord {
 };
 #pragma pack(pop)
 
-typedef void (*set_master_key_func_t)(const unsigned char*, int);
-typedef void (*rc4_encrypt_func_t)(unsigned char*, int, const unsigned char*, int);
+typedef void (*rc4_encrypt_func_t)(unsigned char*, int, const unsigned char*, int, const unsigned char*, int);
 
 struct Args {
     bool add = false;
@@ -49,10 +48,13 @@ struct AddData {
     std::string image_path;
     pthread_mutex_t queue_mutex;
     pthread_mutex_t image_mutex;
+    pthread_mutex_t rc4_mutex;
     pthread_cond_t queue_cond;
     size_t head_index;
     bool stop;
     rc4_encrypt_func_t rc4_encrypt;
+    const unsigned char *key_ptr;
+    int key_len;
     int errors;
     int added;
 };
@@ -169,8 +171,11 @@ static void* add_worker(void *arg) {
         }
         close(fd);
 
-        // Encrypt (master_key already set by do_add)
-        data->rc4_encrypt((unsigned char*)buf.data(), (int)file_size, salt, SALT_SIZE);
+        // Encrypt (serialised — RC4 state is shared global in libxor)
+        pthread_mutex_lock(&data->rc4_mutex);
+        data->rc4_encrypt((unsigned char*)buf.data(), (int)file_size,
+                          data->key_ptr, data->key_len, salt, SALT_SIZE);
+        pthread_mutex_unlock(&data->rc4_mutex);
 
         // Write to image
         pthread_mutex_lock(&data->image_mutex);
@@ -221,7 +226,6 @@ static bool do_add(Args &args) {
     }
 
     // Open image for append (create if doesn't exist)
-    bool exists = (access(args.image.c_str(), F_OK) == 0);
     std::ofstream img(args.image, std::ios::binary | std::ios::app);
     if (!img) {
         std::cerr << "Error: cannot create/open image " << args.image << "\n";
@@ -229,22 +233,19 @@ static bool do_add(Args &args) {
     }
     img.close();
 
-    // Load libxor and get function pointers
+    // Load libxor and get function pointer
     void *handle = dlopen(LIB_PATH, RTLD_NOW);
     if (!handle) {
         std::cerr << "Error: " << dlerror() << "\n";
         return false;
     }
 
-    auto set_master_key = (set_master_key_func_t)dlsym(handle, "set_master_key");
     auto rc4_encrypt = (rc4_encrypt_func_t)dlsym(handle, "rc4_encrypt");
-    if (!set_master_key || !rc4_encrypt) {
-        std::cerr << "Error: symbols not found in " << LIB_PATH << "\n";
+    if (!rc4_encrypt) {
+        std::cerr << "Error: symbol 'rc4_encrypt' not found in " << LIB_PATH << "\n";
         dlclose(handle);
         return false;
     }
-
-    set_master_key((const unsigned char*)args.key.data(), (int)args.key.size());
 
     AddData data;
     data.jobs = std::move(jobs);
@@ -252,11 +253,14 @@ static bool do_add(Args &args) {
     data.head_index = 0;
     data.stop = false;
     data.rc4_encrypt = rc4_encrypt;
+    data.key_ptr = (const unsigned char*)args.key.data();
+    data.key_len = (int)args.key.size();
     data.errors = 0;
     data.added = 0;
 
     pthread_mutex_init(&data.queue_mutex, nullptr);
     pthread_mutex_init(&data.image_mutex, nullptr);
+    pthread_mutex_init(&data.rc4_mutex, nullptr);
     pthread_cond_init(&data.queue_cond, nullptr);
 
     int thread_count = data.jobs.size() < (size_t)MAX_THREADS
@@ -281,6 +285,7 @@ static bool do_add(Args &args) {
 
     pthread_mutex_destroy(&data.queue_mutex);
     pthread_mutex_destroy(&data.image_mutex);
+    pthread_mutex_destroy(&data.rc4_mutex);
     pthread_cond_destroy(&data.queue_cond);
 
     dlclose(handle);
@@ -290,11 +295,6 @@ static bool do_add(Args &args) {
     return data.errors == 0;
 }
 
-static int compare_records(const void *a, const void *b) {
-    const std::pair<std::string, uint32_t> *pa = (const std::pair<std::string, uint32_t>*)a;
-    const std::pair<std::string, uint32_t> *pb = (const std::pair<std::string, uint32_t>*)b;
-    return pa->first.compare(pb->first);
-}
 
 static bool do_list(Args &args) {
     std::ifstream img(args.image, std::ios::binary);
@@ -366,17 +366,16 @@ static bool do_get(Args &args) {
         return false;
     }
 
-    auto set_master_key = (set_master_key_func_t)dlsym(handle, "set_master_key");
     auto rc4_encrypt = (rc4_encrypt_func_t)dlsym(handle, "rc4_encrypt");
-    if (!set_master_key || !rc4_encrypt) {
-        std::cerr << "Error: symbols not found\n";
+    if (!rc4_encrypt) {
+        std::cerr << "Error: symbol 'rc4_encrypt' not found\n";
         dlclose(handle);
         return false;
     }
 
     // RC4 decrypt is same as encrypt (XOR with same keystream)
-    set_master_key((const unsigned char*)args.key.data(), (int)args.key.size());
     rc4_encrypt(found_content.data(), (int)found_content.size(),
+                (const unsigned char*)args.key.data(), (int)args.key.size(),
                 found_salt.data(), SALT_SIZE);
 
     dlclose(handle);

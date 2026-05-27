@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -fPIC -Wall -O2
-LDFLAGS = -shared -lpthread
+LDFLAGS = -shared
 
 TARGET = libxor.so
 SRC = xor.cpp
@@ -13,7 +13,7 @@ all: $(TARGET) $(SECURE_COPY_TARGET)
 $(TARGET): $(SRC) xor.h
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRC)
 
-$(SECURE_COPY_TARGET): $(SECURE_COPY_SRC) $(TARGET)
+$(SECURE_COPY_TARGET): $(SECURE_COPY_SRC)
 	$(CXX) -o $@ $(SECURE_COPY_SRC) -pthread -ldl
 clean:
 	rm -f $(TARGET) $(SECURE_COPY_TARGET)
@@ -21,8 +21,4 @@ clean:
 debug: CXXFLAGS += -DDEBUG_KEY
 debug: clean all
 
-probe: CXXFLAGS += -DDEBUG_KEY
-probe: clean libxor.so
-	$(CXX) -o probe probe.cpp -ldl
-
-.PHONY: all clean debug probe
+.PHONY: all clean debug
