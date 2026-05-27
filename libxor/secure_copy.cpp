@@ -61,7 +61,13 @@ struct AddData {
 
 static void collect_files(const std::string &dir_path, const std::string &base,
                           std::vector<AddJob> &jobs) {
-    DIR *dir = opendir(dir_path.c_str());
+    std::string dp = dir_path;
+    while (dp.size() > 1 && dp.back() == '/')
+        dp.pop_back();
+    std::string b = base;
+    while (b.size() > 1 && b.back() == '/')
+        b.pop_back();
+    DIR *dir = opendir(dp.c_str());
     if (!dir) {
         std::cerr << "Error: cannot open directory " << dir_path << "\n";
         return;
@@ -70,10 +76,10 @@ static void collect_files(const std::string &dir_path, const std::string &base,
     while ((entry = readdir(dir)) != nullptr) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-        std::string full = dir_path + "/" + entry->d_name;
+        std::string full = dp + "/" + entry->d_name;
         struct stat st;
         if (stat(full.c_str(), &st) != 0) continue;
-        std::string rel = base + "/" + entry->d_name;
+        std::string rel = b + "/" + entry->d_name;
         if (S_ISDIR(st.st_mode)) {
             collect_files(full, rel, jobs);
         } else if (S_ISREG(st.st_mode)) {
