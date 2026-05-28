@@ -47,8 +47,10 @@ struct AddData {
     std::vector<AddJob> jobs;
     std::string image_path;
     pthread_mutex_t queue_mutex;
-    pthread_mutex_t image_mutex;
-    pthread_mutex_t rc4_mutex;
+    int img_fd;
+    pthread_mutex_t offset_mutex;
+    pthread_mutex_t count_mutex;
+    off_t write_offset;
     pthread_cond_t queue_cond;
     size_t head_index;
     bool stop;
@@ -89,7 +91,7 @@ static void collect_files(const std::string &dir_path, const std::string &base,
     closedir(dir);
 }
 
-static bool write_record(std::ofstream &img, const std::string &name,
+static bool write_record(int fd, off_t offset, const std::string &name,
                          const unsigned char *salt,
                          const unsigned char *content, uint32_t content_len) {
     uint32_t name_len = (uint32_t)name.size();
@@ -98,12 +100,12 @@ static bool write_record(std::ofstream &img, const std::string &name,
     rec.name_len = name_len;
     memcpy(rec.salt, salt, SALT_SIZE);
 
-    img.write((const char*)&rec, sizeof(rec));
-    if (!img) return false;
-    img.write(name.data(), name_len);
-    if (!img) return false;
-    img.write((const char*)content, content_len);
-    if (!img) return false;
+    if (pwrite(fd, &rec, sizeof(rec), offset) != (ssize_t)sizeof(rec))
+        return false;
+    if (pwrite(fd, name.data(), name_len, offset + sizeof(rec)) != (ssize_t)name_len)
+        return false;
+    if (pwrite(fd, content, content_len, offset + sizeof(rec) + name_len) != (ssize_t)content_len)
+        return false;
     return true;
 }
 
@@ -151,7 +153,9 @@ static void* add_worker(void *arg) {
         std::ifstream src(job.file_path, std::ios::binary);
         if (!src) {
             std::cerr << "Error: cannot read " << job.file_path << "\n";
-            __sync_fetch_and_add(&data->errors, 1);
+            pthread_mutex_lock(&data->count_mutex);
+            data->errors++;
+            pthread_mutex_unlock(&data->count_mutex);
             continue;
         }
         src.seekg(0, std::ios::end);
@@ -161,7 +165,9 @@ static void* add_worker(void *arg) {
         src.read(buf.data(), file_size);
         if ((size_t)src.gcount() != file_size) {
             std::cerr << "Error: short read " << job.file_path << "\n";
-            __sync_fetch_and_add(&data->errors, 1);
+            pthread_mutex_lock(&data->count_mutex);
+            data->errors++;
+            pthread_mutex_unlock(&data->count_mutex);
             continue;
         }
         src.close();
@@ -172,38 +178,35 @@ static void* add_worker(void *arg) {
         if (fd < 0 || read(fd, salt, SALT_SIZE) != SALT_SIZE) {
             std::cerr << "Error: cannot generate salt\n";
             if (fd >= 0) close(fd);
-            __sync_fetch_and_add(&data->errors, 1);
+            pthread_mutex_lock(&data->count_mutex);
+            data->errors++;
+            pthread_mutex_unlock(&data->count_mutex);
             continue;
         }
         close(fd);
 
-        // Encrypt (serialised — RC4 state is shared global in libxor)
-        pthread_mutex_lock(&data->rc4_mutex);
+        // Encrypt
         data->rc4_encrypt((unsigned char*)buf.data(), (int)file_size,
                           data->key_ptr, data->key_len, salt, SALT_SIZE);
-        pthread_mutex_unlock(&data->rc4_mutex);
 
-        // Write to image
-        pthread_mutex_lock(&data->image_mutex);
-        std::ofstream img(data->image_path,
-                          std::ios::binary | std::ios::app);
-        if (!img) {
-            std::cerr << "Error: cannot open image " << data->image_path << "\n";
-            pthread_mutex_unlock(&data->image_mutex);
-            __sync_fetch_and_add(&data->errors, 1);
-            continue;
-        }
-        bool ok = write_record(img, job.rel_name, salt,
+        off_t rec_size = (off_t)sizeof(ImageRecord) + job.rel_name.size() + file_size;
+        pthread_mutex_lock(&data->offset_mutex);
+        off_t my_off = data->write_offset;
+        data->write_offset += rec_size;
+        pthread_mutex_unlock(&data->offset_mutex);
+
+        bool ok = write_record(data->img_fd, my_off, job.rel_name, salt,
                                (unsigned char*)buf.data(), (uint32_t)file_size);
-        img.close();
-        pthread_mutex_unlock(&data->image_mutex);
-
         if (!ok) {
             std::cerr << "Error: cannot write " << job.rel_name << " to image\n";
-            __sync_fetch_and_add(&data->errors, 1);
+            pthread_mutex_lock(&data->count_mutex);
+            data->errors++;
+            pthread_mutex_unlock(&data->count_mutex);
             continue;
         }
-        __sync_fetch_and_add(&data->added, 1);
+        pthread_mutex_lock(&data->count_mutex);
+        data->added++;
+        pthread_mutex_unlock(&data->count_mutex);
         std::cout << "  added " << job.rel_name << " (" << file_size << " bytes)\n";
     }
     return nullptr;
@@ -231,13 +234,18 @@ static bool do_add(Args &args) {
         return false;
     }
 
-    // Open image for append (create if doesn't exist)
-    std::ofstream img(args.image, std::ios::binary | std::ios::app);
-    if (!img) {
+    // Open image (create if doesn't exist), seek to end for append offset
+    int img_fd = open(args.image.c_str(), O_RDWR | O_CREAT, 0644);
+    if (img_fd < 0) {
         std::cerr << "Error: cannot create/open image " << args.image << "\n";
         return false;
     }
-    img.close();
+    off_t existing_size = lseek(img_fd, 0, SEEK_END);
+    if (existing_size < 0) {
+        close(img_fd);
+        std::cerr << "Error: cannot seek image " << args.image << "\n";
+        return false;
+    }
 
     // Load libxor and get function pointer
     void *handle = dlopen(LIB_PATH, RTLD_NOW);
@@ -256,6 +264,8 @@ static bool do_add(Args &args) {
     AddData data;
     data.jobs = std::move(jobs);
     data.image_path = args.image;
+    data.img_fd = img_fd;
+    data.write_offset = existing_size;
     data.head_index = 0;
     data.stop = false;
     data.rc4_encrypt = rc4_encrypt;
@@ -265,8 +275,8 @@ static bool do_add(Args &args) {
     data.added = 0;
 
     pthread_mutex_init(&data.queue_mutex, nullptr);
-    pthread_mutex_init(&data.image_mutex, nullptr);
-    pthread_mutex_init(&data.rc4_mutex, nullptr);
+    pthread_mutex_init(&data.offset_mutex, nullptr);
+    pthread_mutex_init(&data.count_mutex, nullptr);
     pthread_cond_init(&data.queue_cond, nullptr);
 
     int thread_count = data.jobs.size() < (size_t)MAX_THREADS
@@ -289,9 +299,10 @@ static bool do_add(Args &args) {
         pthread_join(threads[i], nullptr);
     }
 
+    close(data.img_fd);
     pthread_mutex_destroy(&data.queue_mutex);
-    pthread_mutex_destroy(&data.image_mutex);
-    pthread_mutex_destroy(&data.rc4_mutex);
+    pthread_mutex_destroy(&data.offset_mutex);
+    pthread_mutex_destroy(&data.count_mutex);
     pthread_cond_destroy(&data.queue_cond);
 
     dlclose(handle);

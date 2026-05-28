@@ -3,21 +3,38 @@
 #include <unistd.h>
 #include <cstring>
 
-static unsigned char* rc4_state = nullptr;
-static size_t page_size = 0;
+struct RC4Ctx {
+    unsigned char* state = nullptr;
+    size_t page_size = 0;
+
+    RC4Ctx() = default;
+
+    RC4Ctx(const RC4Ctx&) = delete;
+    RC4Ctx& operator=(const RC4Ctx&) = delete;
+
+    ~RC4Ctx() {
+        if (state) {
+            mprotect(state, page_size, PROT_READ | PROT_WRITE);
+            memset(state, 0, page_size);
+            munmap(state, page_size);
+        }
+    }
+};
+
+static thread_local RC4Ctx r;
 
 static void ensure_init() {
-    if (page_size) return;
-    page_size = sysconf(_SC_PAGESIZE);
-    rc4_state = (unsigned char*)mmap(nullptr, page_size,
-                                     PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANONYMOUS,
-                                     -1, 0);
-    if (rc4_state != MAP_FAILED) {
-        memset(rc4_state, 0, page_size);
-        mprotect(rc4_state, page_size, PROT_NONE);
+    if (r.page_size) return;
+    r.page_size = sysconf(_SC_PAGESIZE);
+    r.state = (unsigned char*)mmap(nullptr, r.page_size,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS,
+                                   -1, 0);
+    if (r.state != MAP_FAILED) {
+        memset(r.state, 0, r.page_size);
+        mprotect(r.state, r.page_size, PROT_NONE);
     } else {
-        rc4_state = nullptr;
+        r.state = nullptr;
     }
 }
 
@@ -28,9 +45,9 @@ void rc4_encrypt(unsigned char *data, int data_len,
                  const unsigned char *salt, int salt_len) {
     if (!data || data_len <= 0 || !key || key_len <= 0) return;
     ensure_init();
-    if (!rc4_state) return;
+    if (!r.state) return;
 
-    mprotect(rc4_state, page_size, PROT_READ | PROT_WRITE);
+    mprotect(r.state, r.page_size, PROT_READ | PROT_WRITE);
 
     // Build full key on stack: key + salt, max 256 bytes
     int full_key_len = key_len + (salt && salt_len > 0 ? salt_len : 0);
@@ -47,45 +64,46 @@ void rc4_encrypt(unsigned char *data, int data_len,
 
     // KSA
     for (int i = 0; i < 256; i++)
-        rc4_state[i] = i;
+        r.state[i] = i;
 
     int j = 0;
     for (int i = 0; i < 256; i++) {
-        j = (j + rc4_state[i] + full_key[i % full_key_len]) & 0xFF;
-        rc4_state[i] ^= rc4_state[j];
-        rc4_state[j] ^= rc4_state[i];
-        rc4_state[i] ^= rc4_state[j];
+        j = (j + r.state[i] + full_key[i % full_key_len]) & 0xFF;
+        if (i != j) {
+            r.state[i] ^= r.state[j];
+            r.state[j] ^= r.state[i];
+            r.state[i] ^= r.state[j];
+        }
     }
 
     memset(full_key, 0, sizeof(full_key));
 
     // i, j at the end of page
-    unsigned char *i_ptr = rc4_state + page_size - 2;
-    unsigned char *j_ptr = rc4_state + page_size - 1;
+    unsigned char *i_ptr = r.state + r.page_size - 2;
+    unsigned char *j_ptr = r.state + r.page_size - 1;
     *i_ptr = 0;
     *j_ptr = 0;
 
     // PRGA
     for (int n = 0; n < data_len; n++) {
         *i_ptr = (*i_ptr + 1) & 0xFF;
-        *j_ptr = (*j_ptr + rc4_state[*i_ptr]) & 0xFF;
-        rc4_state[*i_ptr] ^= rc4_state[*j_ptr];
-        rc4_state[*j_ptr] ^= rc4_state[*i_ptr];
-        rc4_state[*i_ptr] ^= rc4_state[*j_ptr];
-        unsigned char K = rc4_state[(rc4_state[*i_ptr] + rc4_state[*j_ptr]) & 0xFF];
+        *j_ptr = (*j_ptr + r.state[*i_ptr]) & 0xFF;
+        if (*i_ptr != *j_ptr) {
+            r.state[*i_ptr] ^= r.state[*j_ptr];
+            r.state[*j_ptr] ^= r.state[*i_ptr];
+            r.state[*i_ptr] ^= r.state[*j_ptr];
+        }
+        unsigned char K = r.state[(r.state[*i_ptr] + r.state[*j_ptr]) & 0xFF];
         data[n] ^= K;
     }
 
-    mprotect(rc4_state, page_size, PROT_NONE);
+    mprotect(r.state, r.page_size, PROT_NONE);
 }
 
 void secure_cleanup(void) {
-    if (!rc4_state) return;
-    mprotect(rc4_state, page_size, PROT_READ | PROT_WRITE);
-    memset(rc4_state, 0, page_size);
-    munmap(rc4_state, page_size);
-    rc4_state = nullptr;
-    page_size = 0;
+    // Each thread owns its own thread_local RC4Ctx, which cleans up in its destructor.
+    // This function is kept for API compatibility.
+    // To force cleanup, threads must be joined and the thread_local storage destroyed.
 }
 
 }
